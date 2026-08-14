@@ -9,6 +9,8 @@
 import argparse
 import json
 import logging
+import math
+import signal
 import time
 
 import carla
@@ -39,19 +41,10 @@ def _setup_vehicle(world, config):
     bp.set_attribute("role_name", config.get("id"))
     bp.set_attribute("ros_name", config.get("id"))
 
-    # Use fixed spawn point from config if provided, otherwise use first available
-    sp = config.get("spawn_point")
-    if sp:
-        transform = carla.Transform(
-            carla.Location(x=sp["x"], y=sp["y"], z=sp["z"]),
-            carla.Rotation(roll=sp.get("roll", 0.0),
-                           pitch=sp.get("pitch", 0.0),
-                           yaw=sp.get("yaw", 0.0))
-        )
-    else:
-        transform = map_.get_spawn_points()[0]
-
-    return world.spawn_actor(bp, transform, attach_to=None)
+    return  world.spawn_actor(
+        bp,
+        map_.get_spawn_points()[0],
+        attach_to=None)
 
 
 def _setup_sensors(world, vehicle, sensors_config):
@@ -93,6 +86,29 @@ def _setup_sensors(world, vehicle, sensors_config):
     return sensors
 
 
+def _update_spectator(world, vehicle, distance=6.0, height=3.0, pitch=-15.0):
+    """Move the spectator to a third-person chase view behind the vehicle."""
+    transform = vehicle.get_transform()
+    yaw = transform.rotation.yaw
+
+    # Unit forward vector of the vehicle (CARLA's left-handed UE convention).
+    forward = carla.Vector3D(
+        x=math.cos(math.radians(yaw)),
+        y=math.sin(math.radians(yaw)),
+        z=0.0
+    )
+
+    location = transform.location - forward * distance
+    location.z += height
+
+    spectator_transform = carla.Transform(
+        location=location,
+        rotation=carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0)
+    )
+
+    world.get_spectator().set_transform(spectator_transform)
+
+
 def main(args):
 
     world = None
@@ -112,8 +128,14 @@ def main(args):
         original_settings = world.get_settings()
         settings = world.get_settings()
         settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 0.04
+        settings.fixed_delta_seconds = 1.0 / 20.0  # 20 Hz base tick
         world.apply_settings(settings)
+
+        applied = world.get_settings()
+        logging.info(
+            "Applied settings -- synchronous_mode=%s fixed_delta_seconds=%s",
+            applied.synchronous_mode, applied.fixed_delta_seconds
+        )
 
         traffic_manager = client.get_trafficmanager()
         traffic_manager.set_synchronous_mode(True)
@@ -125,34 +147,40 @@ def main(args):
 
         vehicle.set_autopilot(config.get("autopilot", False))
 
-        # ── Spectator follow cam ──────────────────────────────────────────────
-        spectator = world.get_spectator()
-
         logging.info("Running...")
 
+        target_dt = settings.fixed_delta_seconds
+        next_tick_at = time.perf_counter()
+
+        tick_count = 0
+        window_start = time.perf_counter()
+        LOG_EVERY_N_TICKS = 100
+
         while True:
-            t0 = time.time()
-
             _ = world.tick()
+            _update_spectator(world, vehicle)
 
-            # Update spectator to follow vehicle from behind
-            transform = vehicle.get_transform()
-            fwd = transform.get_forward_vector()
-            spectator.set_transform(carla.Transform(
-                transform.location + carla.Location(
-                    x=fwd.x * -6,
-                    y=fwd.y * -6,
-                    z=3
-                ),
-                carla.Rotation(pitch=-10, yaw=transform.rotation.yaw)
-            ))
+            tick_count += 1
+            if tick_count % LOG_EVERY_N_TICKS == 0:
+                now = time.perf_counter()
+                measured_hz = LOG_EVERY_N_TICKS / (now - window_start)
+                logging.info(
+                    "Measured client tick rate: %.2f Hz (target %.2f Hz)",
+                    measured_hz, 1.0 / target_dt
+                )
+                window_start = now
 
-            # Pace the loop to match fixed_delta_seconds in wall-clock time
-            # so that sensor_tick values correspond to real-time frequencies
-            elapsed = time.time() - t0
-            sleep_time = settings.fixed_delta_seconds - elapsed
+            # Sync mode advances sim time by target_dt per tick but does not
+            # pace itself to real time -- without this, a light scene ticks
+            # faster than real-time and every sensor's Hz scales up with it.
+            next_tick_at += target_dt
+            sleep_time = next_tick_at - time.perf_counter()
             if sleep_time > 0:
                 time.sleep(sleep_time)
+            else:
+                # We're behind real time (server can't keep up at this rate);
+                # reset the reference instead of trying to "catch up" in a burst.
+                next_tick_at = time.perf_counter()
 
     except KeyboardInterrupt:
         print('\nCancelled by user. Bye!')
@@ -181,5 +209,11 @@ if __name__ == '__main__':
     logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
 
     logging.info('Listening to server %s:%s', args.host, args.port)
+
+    # Containers stop with SIGTERM; translate it into KeyboardInterrupt so the
+    # cleanup in main() runs (destroy actors, restore world settings).
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     main(args)
